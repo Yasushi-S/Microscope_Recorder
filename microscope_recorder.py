@@ -14,11 +14,12 @@ from datetime import datetime
 from PIL import Image, ImageTk
 
 # ── 設定 ────────────────────────────────────────────────
-SAVE_DIR = r"C:\MicroscopeRecords"   # 保存先フォルダ（変更可）
+SAVE_DIR = r"C:\Users\shita\Videos\PC04顕微鏡画像"   # 保存先フォルダ（変更可）
 CAMERA_INDEX = 0                      # USBカメラのインデックス（通常0）
 PREVIEW_FPS = 15                      # プレビューFPS
 RECORD_FPS = 15                       # 録画FPS
-PREVIEW_SIZE = (640, 480)            # プレビュー解像度
+PREVIEW_SIZE = (960, 540)            # プレビュー表示サイズ（画面表示用）
+CAPTURE_SIZE = (1920, 1080)          # カメラ取得・録画解像度
 
 SPECIMEN_TYPES = [
     "帯下",
@@ -39,7 +40,7 @@ def sanitize_for_filename(text: str) -> str:
     return INVALID_FILENAME_CHARS.sub("_", text).strip()
 
 
-def generate_filename(patient_id: str, specimen: str, save_dir: str) -> str:
+def generate_filename(patient_id: str, specimen: str, save_dir: str, ext: str = "mp4") -> str:
     date_str = datetime.now().strftime("%Y%m%d")
     safe_id = sanitize_for_filename(patient_id)
     safe_specimen = sanitize_for_filename(specimen)
@@ -47,15 +48,15 @@ def generate_filename(patient_id: str, specimen: str, save_dir: str) -> str:
     # 連番を検索して付与
     existing = [
         f for f in os.listdir(save_dir)
-        if f.startswith(base) and f.endswith(".mp4")
+        if f.startswith(base) and f.endswith(f".{ext}")
     ]
     nums = []
     for f in existing:
-        m = re.search(r"_(\d+)\.mp4$", f)
+        m = re.search(rf"_(\d+)\.{ext}$", f)
         if m:
             nums.append(int(m.group(1)))
     next_num = max(nums) + 1 if nums else 1
-    return os.path.join(save_dir, f"{base}_{next_num:03d}.mp4")
+    return os.path.join(save_dir, f"{base}_{next_num:03d}.{ext}")
 
 
 # ── メインアプリ ─────────────────────────────────────────
@@ -70,6 +71,8 @@ class MicroscopeApp:
         self.recording = False
         self.writer = None
         self.writer_lock = threading.Lock()
+        self.last_frame = None
+        self.frame_lock = threading.Lock()
         self.preview_thread = None
         self.record_timer = None
         self.remaining = 0
@@ -213,6 +216,23 @@ class MicroscopeApp:
         )
         self.rec_btn.pack(fill="x", ipady=10)
 
+        self.photo_btn = tk.Button(
+            btn_frame,
+            text="📷  静止画撮影",
+            font=("Meiryo UI", 13, "bold"),
+            bg="#0f3460", fg="white",
+            activebackground="#16213e", activeforeground="white",
+            relief="flat", bd=0, cursor="hand2",
+            command=self._capture_photo
+        )
+        self.photo_btn.pack(fill="x", ipady=10, pady=(8, 0))
+
+        # 撮影ステータス表示
+        self.capture_status_var = tk.StringVar(value="")
+        tk.Label(right, textvariable=self.capture_status_var,
+                 font=("Meiryo UI", 9, "bold"),
+                 fg="#4caf50", bg="#1a1a2e").pack(anchor="w", pady=(4, 0))
+
         # 保存フォルダ表示
         tk.Label(right, text=f"保存先: {SAVE_DIR}", font=("Meiryo UI", 8),
                  fg="#3a4a5a", bg="#1a1a2e").pack(anchor="w")
@@ -222,7 +242,8 @@ class MicroscopeApp:
         sp = self.specimen_var.get()
         date_str = datetime.now().strftime("%Y%m%d")
         safe_sp = sanitize_for_filename(sp)
-        self.fname_var.set(f"例: {date_str}_{pid}_{safe_sp}_001.mp4")
+        base = f"{date_str}_{pid}_{safe_sp}_001"
+        self.fname_var.set(f"例: {base}.mp4 / {base}.jpg")
 
     # ── カメラプレビュー ─────────────────────────────────
     def _start_preview(self):
@@ -234,9 +255,10 @@ class MicroscopeApp:
             self.cap.release()
             self.cap = None
             self.rec_btn.config(state="disabled")
+            self.photo_btn.config(state="disabled")
             return
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, PREVIEW_SIZE[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_SIZE[1])
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
         self.preview_active = True
         self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
         self.preview_thread.start()
@@ -248,10 +270,13 @@ class MicroscopeApp:
             if not ret:
                 time.sleep(delay)
                 continue
+            with self.frame_lock:
+                self.last_frame = frame
             with self.writer_lock:
                 if self.recording and self.writer:
                     self.writer.write(frame)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            preview_frame = cv2.resize(frame, PREVIEW_SIZE)
+            frame_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             # PhotoImageの生成・キャンバス更新はメインスレッドで行う
             self.canvas.after(0, self._update_canvas, img)
@@ -264,6 +289,40 @@ class MicroscopeApp:
             self._img_id = self.canvas.create_image(0, 0, anchor="nw", image=imgtk)
         else:
             self.canvas.itemconfig(self._img_id, image=imgtk)
+
+    # ── 静止画撮影 ───────────────────────────────────────
+    def _capture_photo(self):
+        if self.cap is None or not self.cap.isOpened():
+            messagebox.showerror("カメラエラー", "カメラが利用できないため撮影できません。")
+            return
+
+        patient_id = self.id_var.get().strip()
+        if not patient_id:
+            messagebox.showwarning("入力エラー", "患者IDを入力してください。")
+            return
+
+        with self.frame_lock:
+            frame = self.last_frame
+
+        if frame is None:
+            messagebox.showerror("撮影エラー", "映像を取得できませんでした。")
+            return
+
+        filepath = generate_filename(patient_id, self.specimen_var.get(), SAVE_DIR, ext="jpg")
+        if not cv2.imwrite(filepath, frame):
+            messagebox.showerror("撮影エラー",
+                                 "画像を保存できませんでした。\n"
+                                 "保存先フォルダの権限や空き容量を確認してください。")
+            return
+
+        self._flash_canvas()
+        fname = os.path.basename(filepath)
+        self.capture_status_var.set(f"📷 保存しました: {fname}")
+        self.root.after(3000, lambda: self.capture_status_var.set(""))
+
+    def _flash_canvas(self):
+        self.canvas.config(highlightbackground="#ffffff")
+        self.root.after(120, lambda: self.canvas.config(highlightbackground="#16213e"))
 
     # ── 録画制御 ─────────────────────────────────────────
     def _toggle_record(self):
