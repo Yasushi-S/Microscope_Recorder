@@ -21,11 +21,14 @@ RECORD_FPS = 15                       # 録画FPS
 PREVIEW_SIZE = (960, 540)            # プレビュー表示サイズ（画面表示用）
 CAPTURE_SIZE = (1920, 1080)          # カメラ取得・録画解像度
 
+# 露光設定（視野移動時のブレ対策）
+MANUAL_EXPOSURE = True                # True: 露光時間を固定してブレを抑える / False: カメラのオートに任せる
+EXPOSURE_VALUE = -9                   # 値が小さいほど露光時間が短くブレにくいが暗くなる（カメラ依存。要調整）
+
 SPECIMEN_TYPES = [
-    "帯下",
-    "精子",
-    "尿沈渣",
-    "血液",
+    "帯下(生食)",
+    "帯下(KOH)",
+    "精液",
     "その他",
 ]
 
@@ -34,6 +37,7 @@ DEFAULT_DURATION = 30   # デフォルト録画秒数
 
 # ── ファイル名生成 ────────────────────────────────────────
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+PATIENT_ID_PATTERN = re.compile(r'^\d{5}$')
 
 
 def sanitize_for_filename(text: str) -> str:
@@ -227,6 +231,17 @@ class MicroscopeApp:
         )
         self.photo_btn.pack(fill="x", ipady=10, pady=(8, 0))
 
+        self.next_patient_btn = tk.Button(
+            btn_frame,
+            text="👤  次の患者",
+            font=("Meiryo UI", 11),
+            bg="#16213e", fg="#c0c0c0",
+            activebackground="#0f3460", activeforeground="white",
+            relief="flat", bd=0, cursor="hand2",
+            command=self._next_patient
+        )
+        self.next_patient_btn.pack(fill="x", ipady=8, pady=(8, 0))
+
         # 撮影ステータス表示
         self.capture_status_var = tk.StringVar(value="")
         tk.Label(right, textvariable=self.capture_status_var,
@@ -236,6 +251,45 @@ class MicroscopeApp:
         # 保存フォルダ表示
         tk.Label(right, text=f"保存先: {SAVE_DIR}", font=("Meiryo UI", 8),
                  fg="#3a4a5a", bg="#1a1a2e").pack(anchor="w")
+
+        # 保存済みファイル一覧
+        section_label(left, "本日の保存済みファイル（新しい順）")
+        list_frame = tk.Frame(left, bg="#1a1a2e")
+        list_frame.pack(fill="x")
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.file_listbox = tk.Listbox(
+            list_frame,
+            font=("Meiryo UI", 9),
+            bg="#16213e", fg="#e0e0e0",
+            selectbackground="#0f3460",
+            activestyle="none",
+            relief="flat", bd=0, height=5,
+            highlightthickness=1,
+            highlightbackground="#0f3460",
+            yscrollcommand=scrollbar.set,
+        )
+        self.file_listbox.pack(side="left", fill="x", expand=True)
+        scrollbar.config(command=self.file_listbox.yview)
+
+        self._refresh_file_list()
+
+    def _refresh_file_list(self):
+        today = datetime.now().strftime("%Y%m%d")
+        try:
+            files = [
+                f for f in os.listdir(SAVE_DIR)
+                if f.startswith(today) and f.endswith((".mp4", ".jpg"))
+            ]
+        except OSError:
+            files = []
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(SAVE_DIR, f)), reverse=True)
+        self.file_listbox.delete(0, tk.END)
+        for f in files:
+            icon = "🎬" if f.endswith(".mp4") else "📷"
+            self.file_listbox.insert(tk.END, f"{icon} {f}")
 
     def _update_fname_preview(self):
         pid = sanitize_for_filename(self.id_var.get().strip()) or "ID"
@@ -261,6 +315,10 @@ class MicroscopeApp:
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
+        if MANUAL_EXPOSURE:
+            # DirectShowでは 0.25=マニュアル, 0.75=オート
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, EXPOSURE_VALUE)
         self.preview_active = True
         self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
         self.preview_thread.start()
@@ -299,8 +357,8 @@ class MicroscopeApp:
             return
 
         patient_id = self.id_var.get().strip()
-        if not patient_id:
-            messagebox.showwarning("入力エラー", "患者IDを入力してください。")
+        if not PATIENT_ID_PATTERN.match(patient_id):
+            messagebox.showwarning("入力エラー", "患者IDは5桁の数字で入力してください。")
             return
 
         with self.frame_lock:
@@ -321,10 +379,17 @@ class MicroscopeApp:
         fname = os.path.basename(filepath)
         self.capture_status_var.set(f"📷 保存しました: {fname}")
         self.root.after(3000, lambda: self.capture_status_var.set(""))
+        self._refresh_file_list()
 
     def _flash_canvas(self):
         self.canvas.config(highlightbackground="#ffffff")
         self.root.after(120, lambda: self.canvas.config(highlightbackground="#16213e"))
+
+    # ── 患者切替 ─────────────────────────────────────────
+    def _next_patient(self):
+        self.id_var.set("")
+        self.specimen_var.set(SPECIMEN_TYPES[0])
+        self.id_entry.focus_set()
 
     # ── 録画制御 ─────────────────────────────────────────
     def _toggle_record(self):
@@ -339,8 +404,8 @@ class MicroscopeApp:
             return
 
         patient_id = self.id_var.get().strip()
-        if not patient_id:
-            messagebox.showwarning("入力エラー", "患者IDを入力してください。")
+        if not PATIENT_ID_PATTERN.match(patient_id):
+            messagebox.showwarning("入力エラー", "患者IDは5桁の数字で入力してください。")
             return
 
         # 録画時間の取得
@@ -374,6 +439,7 @@ class MicroscopeApp:
         self.remaining = duration
         self.rec_btn.config(text="⏹  録画停止", bg="#444")
         self.rec_indicator.config(text="● REC")
+        self.next_patient_btn.config(state="disabled")
         self._tick(filepath)
 
     def _tick(self, filepath):
@@ -398,6 +464,8 @@ class MicroscopeApp:
         self.rec_btn.config(text="⏺  録画開始", bg="#e94560")
         self.rec_indicator.config(text="")
         self.countdown_var.set("")
+        self.next_patient_btn.config(state="normal")
+        self._refresh_file_list()
         if auto and filepath:
             fname = os.path.basename(filepath)
             messagebox.showinfo("録画完了", f"保存しました:\n{fname}")
