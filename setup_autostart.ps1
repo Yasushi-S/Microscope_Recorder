@@ -1,4 +1,4 @@
-# 顕微鏡録画アプリを Windows ログオン時に自動起動するタスクを登録する
+﻿# 顕微鏡録画アプリを Windows ログオン時に自動起動するタスクを登録する
 $ErrorActionPreference = "Stop"
 
 $root = $PSScriptRoot
