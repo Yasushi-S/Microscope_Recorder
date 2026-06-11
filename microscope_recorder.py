@@ -257,6 +257,8 @@ class MicroscopeApp:
             self.rec_btn.config(state="disabled")
             self.photo_btn.config(state="disabled")
             return
+        # MJPG指定でUSB帯域不足による1080pキャプチャの遅延・カクつきを回避
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
         self.preview_active = True
