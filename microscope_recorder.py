@@ -10,14 +10,15 @@ import threading
 import time
 import os
 import re
+import subprocess
 from datetime import datetime
 from PIL import Image, ImageTk
 
 # ── 設定 ────────────────────────────────────────────────
 SAVE_DIR = r"C:\Users\shita\Videos\PC04顕微鏡画像"   # 保存先フォルダ（変更可）
 CAMERA_INDEX = 0                      # USBカメラのインデックス（通常0）
-PREVIEW_FPS = 15                      # プレビューFPS
-RECORD_FPS = 15                       # 録画FPS
+PREVIEW_FPS = 30                      # プレビューFPS
+RECORD_FPS = 30                       # 録画FPS（カメラが対応できる上限まで自動調整される）
 PREVIEW_SIZE = (960, 540)            # プレビュー表示サイズ（画面表示用）
 CAPTURE_SIZE = (1920, 1080)          # カメラ取得・録画解像度
 
@@ -73,7 +74,7 @@ class MicroscopeApp:
 
         self.cap = None
         self.recording = False
-        self.writer = None
+        self.ffmpeg_proc = None
         self.writer_lock = threading.Lock()
         self.last_frame = None
         self.frame_lock = threading.Lock()
@@ -315,6 +316,7 @@ class MicroscopeApp:
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
+        self.cap.set(cv2.CAP_PROP_FPS, RECORD_FPS)
         if MANUAL_EXPOSURE:
             # DirectShowでは 0.25=マニュアル, 0.75=オート
             self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
@@ -324,23 +326,30 @@ class MicroscopeApp:
         self.preview_thread.start()
 
     def _preview_loop(self):
-        delay = 1.0 / PREVIEW_FPS
+        preview_interval = 1.0 / PREVIEW_FPS
+        last_preview_time = 0.0
         while self.preview_active:
             ret, frame = self.cap.read()
             if not ret:
-                time.sleep(delay)
+                time.sleep(0.01)
                 continue
             with self.frame_lock:
                 self.last_frame = frame
             with self.writer_lock:
-                if self.recording and self.writer:
-                    self.writer.write(frame)
-            preview_frame = cv2.resize(frame, PREVIEW_SIZE)
-            frame_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
-            # PhotoImageの生成・キャンバス更新はメインスレッドで行う
-            self.canvas.after(0, self._update_canvas, img)
-            time.sleep(delay)
+                if self.recording and self.ffmpeg_proc:
+                    try:
+                        self.ffmpeg_proc.stdin.write(frame.tobytes())
+                    except OSError:
+                        pass
+            # プレビュー更新はPREVIEW_FPS に独立して制限（録画は全フレーム書き込む）
+            now = time.monotonic()
+            if now - last_preview_time >= preview_interval:
+                last_preview_time = now
+                preview_frame = cv2.resize(frame, PREVIEW_SIZE)
+                frame_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                # PhotoImageの生成・キャンバス更新はメインスレッドで行う
+                self.canvas.after(0, self._update_canvas, img)
 
     def _update_canvas(self, img):
         imgtk = ImageTk.PhotoImage(image=img)
@@ -424,17 +433,31 @@ class MicroscopeApp:
         filepath = generate_filename(patient_id, self.specimen_var.get(), SAVE_DIR)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(filepath, fourcc, RECORD_FPS, (w, h))
-        if not writer.isOpened():
-            writer.release()
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if actual_fps <= 0 or actual_fps > 120:
+            actual_fps = RECORD_FPS
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "bgr24",
+            "-r", str(actual_fps),
+            "-i", "pipe:",
+            "-vcodec", "libx264",
+            "-crf", "18",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            filepath,
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception as e:
             messagebox.showerror("録画エラー",
-                                 "録画ファイルを作成できませんでした。\n"
-                                 "保存先フォルダの権限や空き容量を確認してください。")
+                                 f"ffmpegを起動できませんでした。\n{e}")
             return
 
         with self.writer_lock:
-            self.writer = writer
+            self.ffmpeg_proc = proc
             self.recording = True
         self.remaining = duration
         self.rec_btn.config(text="⏹  録画停止", bg="#444")
@@ -453,17 +476,33 @@ class MicroscopeApp:
         self.record_timer = self.root.after(1000, self._tick, filepath)
 
     def _stop_record(self, filepath="", auto=False):
-        self.recording = False
         if self.record_timer:
             self.root.after_cancel(self.record_timer)
             self.record_timer = None
         with self.writer_lock:
-            if self.writer:
-                self.writer.release()
-                self.writer = None
-        self.rec_btn.config(text="⏺  録画開始", bg="#e94560")
-        self.rec_indicator.config(text="")
+            self.recording = False
+            proc = self.ffmpeg_proc
+            self.ffmpeg_proc = None
+
+        self.rec_btn.config(text="⏺  録画開始", bg="#e94560", state="disabled")
+        self.rec_indicator.config(text="● 保存中...")
         self.countdown_var.set("")
+        self.next_patient_btn.config(state="disabled")
+
+        def finalize():
+            if proc:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                proc.wait()
+            self.root.after(0, lambda: self._on_record_finalized(filepath, auto))
+
+        threading.Thread(target=finalize, daemon=True).start()
+
+    def _on_record_finalized(self, filepath, auto):
+        self.rec_btn.config(text="⏺  録画開始", bg="#e94560", state="normal")
+        self.rec_indicator.config(text="")
         self.next_patient_btn.config(state="normal")
         self._refresh_file_list()
         if auto and filepath:
@@ -473,13 +512,18 @@ class MicroscopeApp:
     # ── 終了処理 ─────────────────────────────────────────
     def on_close(self):
         self.preview_active = False
-        self.recording = False
+        with self.writer_lock:
+            self.recording = False
+            proc = self.ffmpeg_proc
+            self.ffmpeg_proc = None
         if self.preview_thread:
             self.preview_thread.join(timeout=1.0)
-        with self.writer_lock:
-            if self.writer:
-                self.writer.release()
-                self.writer = None
+        if proc:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.wait(timeout=5.0)
         if self.cap:
             self.cap.release()
         self.root.destroy()
