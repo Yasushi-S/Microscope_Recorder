@@ -449,8 +449,10 @@ class MicroscopeApp:
             "-pix_fmt", "yuv420p",
             filepath,
         ]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     creationflags=creationflags)
         except Exception as e:
             messagebox.showerror("録画エラー",
                                  f"ffmpegを起動できませんでした。\n{e}")
