@@ -79,6 +79,7 @@ class MicroscopeApp:
         self.last_frame = None
         self.frame_lock = threading.Lock()
         self.preview_thread = None
+        self.record_writer_thread = None
         self.record_timer = None
         self.remaining = 0
         self.preview_active = False
@@ -335,13 +336,7 @@ class MicroscopeApp:
                 continue
             with self.frame_lock:
                 self.last_frame = frame
-            with self.writer_lock:
-                if self.recording and self.ffmpeg_proc:
-                    try:
-                        self.ffmpeg_proc.stdin.write(frame.tobytes())
-                    except OSError:
-                        pass
-            # プレビュー更新はPREVIEW_FPS に独立して制限（録画は全フレーム書き込む）
+            # プレビュー更新はPREVIEW_FPS に独立して制限
             now = time.monotonic()
             if now - last_preview_time >= preview_interval:
                 last_preview_time = now
@@ -358,6 +353,31 @@ class MicroscopeApp:
             self._img_id = self.canvas.create_image(0, 0, anchor="nw", image=imgtk)
         else:
             self.canvas.itemconfig(self._img_id, image=imgtk)
+
+    # ── 録画書き込み（実時間に同期させてフレームを送出） ─────
+    def _record_writer_loop(self, proc):
+        # カメラの実際の取得速度に関わらず、実時間どおりの再生速度になるよう
+        # 一定間隔（RECORD_FPS）で最新フレームをffmpegへ送出する。
+        # カメラが遅い場合は直前フレームを再送（複製）し、速い場合は間引く。
+        interval = 1.0 / RECORD_FPS
+        next_time = time.monotonic()
+        while True:
+            with self.writer_lock:
+                if not self.recording or self.ffmpeg_proc is not proc:
+                    break
+            with self.frame_lock:
+                frame = self.last_frame
+            if frame is not None:
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except OSError:
+                    break
+            next_time += interval
+            sleep_time = next_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_time = time.monotonic()
 
     # ── 静止画撮影 ───────────────────────────────────────
     def _capture_photo(self):
@@ -433,15 +453,12 @@ class MicroscopeApp:
         filepath = generate_filename(patient_id, self.specimen_var.get(), SAVE_DIR)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        if actual_fps <= 0 or actual_fps > 120:
-            actual_fps = RECORD_FPS
         cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-vcodec", "rawvideo",
             "-s", f"{w}x{h}",
             "-pix_fmt", "bgr24",
-            "-r", str(actual_fps),
+            "-r", str(RECORD_FPS),
             "-i", "pipe:",
             "-vcodec", "libx264",
             "-crf", "18",
@@ -461,6 +478,10 @@ class MicroscopeApp:
         with self.writer_lock:
             self.ffmpeg_proc = proc
             self.recording = True
+        self.record_writer_thread = threading.Thread(
+            target=self._record_writer_loop, args=(proc,), daemon=True
+        )
+        self.record_writer_thread.start()
         self.remaining = duration
         self.rec_btn.config(text="⏹  録画停止", bg="#444")
         self.rec_indicator.config(text="● REC")
@@ -492,6 +513,9 @@ class MicroscopeApp:
         self.next_patient_btn.config(state="disabled")
 
         def finalize():
+            if self.record_writer_thread:
+                self.record_writer_thread.join(timeout=2.0)
+                self.record_writer_thread = None
             if proc:
                 try:
                     proc.stdin.close()
@@ -520,6 +544,9 @@ class MicroscopeApp:
             self.ffmpeg_proc = None
         if self.preview_thread:
             self.preview_thread.join(timeout=1.0)
+        if self.record_writer_thread:
+            self.record_writer_thread.join(timeout=2.0)
+            self.record_writer_thread = None
         if proc:
             try:
                 proc.stdin.close()
