@@ -30,7 +30,10 @@ RECORD_SIZE = (1920, 1080)           # 録画（保存）解像度
 
 # 露光設定（視野移動時のブレ対策）
 MANUAL_EXPOSURE = True                # True: 露光時間を固定してブレを抑える / False: カメラのオートに任せる
-EXPOSURE_VALUE = -9                   # 値が小さいほど露光時間が短くブレにくいが暗くなる（カメラ依存。要調整）
+EXPOSURE_VALUE = -6                   # 値が小さいほど露光時間が短くブレにくいが暗くなる（カメラ依存）
+# 旧来のCAP_DSHOW用に-9で調整していたが、CAP_MSMFでは内部的に-6にクランプされ
+# 実際の露光がほぼゼロ（画面が真っ黒）になっていたため-6に変更（実機検証済み:
+# -9指定時の平均輝度6.62/255 → -6指定で169.57/255）。
 
 SPECIMEN_TYPES = [
     "帯下(生食)",
@@ -327,7 +330,6 @@ class MicroscopeApp:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
         self.cap.set(cv2.CAP_PROP_FPS, RECORD_FPS)
         if MANUAL_EXPOSURE:
-            # MSMFでは露光値のスケールがDirectShowと異なるため、EXPOSURE_VALUEは要調整
             self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             self.cap.set(cv2.CAP_PROP_EXPOSURE, EXPOSURE_VALUE)
         self.preview_active = True
